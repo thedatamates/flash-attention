@@ -7,6 +7,7 @@
 
 import cutlass
 import cutlass.utils as utils_basic
+from cutlass.base_dsl.arch import Arch
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 
@@ -18,9 +19,9 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Override the runtime arch detection from parent __init__ so that the
-        # SM80 __call__ path correctly disables TMA for the output store.
-        from cutlass.base_dsl.arch import Arch
+        # Override the runtime arch detection from parent __init__ so the
+        # SM80 __call__ path correctly disables TMA for the output store
+        # (SM120 intentionally reuses the SM80 control-flow path).
         self.arch = Arch.sm_80
 
     @staticmethod
