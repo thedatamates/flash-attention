@@ -575,10 +575,11 @@ def _flash_attn_fwd(
         and head_dim_v == 512
     ):
         # The SM80-style SM120 forward's full-width Dv=512 PV/O path corrupts
-        # some rows. Split only V/O into two Dv=256 CuTe launches; each launch
-        # still uses the full D=512 QK score and stays below the 99 KiB SM120 cap.
-        for d_start in (0, 256):
-            d_end = d_start + 256
+        # some rows. Split only V/O into four Dv=128 CuTe launches. The
+        # 64x16 tile shape keeps SMEM under the 99 KiB SM120 cap and produces
+        # stable LSE for the D512 global-attention path.
+        for d_start in (0, 128, 256, 384):
+            d_end = d_start + 128
             write_lse = d_start == 0 and lse is not None
             _flash_attn_fwd(
                 q,
@@ -599,7 +600,7 @@ def _flash_attn_fwd(
                 window_size_left=window_size_left,
                 window_size_right=window_size_right,
                 learnable_sink=learnable_sink,
-                tile_mn=tile_mn,
+                tile_mn=(64, 16),
                 mma_pv_is_rs=mma_pv_is_rs,
                 intra_wg_overlap=intra_wg_overlap,
                 num_threads=num_threads,
