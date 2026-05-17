@@ -502,8 +502,12 @@ def _flash_attn_fwd(
                 fwd_cfg = FwdConfig(128, 128, True, True)  # 48 KB
             elif head_dim <= 128:
                 fwd_cfg = FwdConfig(128, 64, True, True)   # 64 KB
-            else:
+            elif head_dim <= 256:
                 fwd_cfg = FwdConfig(64, 64, True, True)    # 64 KB for D=256
+            else:
+                # D=512 (Gemma 4 global attention): 32*512*2*3 = 96 KB fits;
+                # any tile_m >= 64 at D=512 would exceed the cap.
+                fwd_cfg = FwdConfig(32, 32, True, True)    # 96 KB for D=512
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -559,6 +563,58 @@ def _flash_attn_fwd(
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+
+    if (
+        arch // 10 == 12
+        and qv is None
+        and not is_fp8
+        and not is_split_kv
+        and block_sparse_tensors is None
+        and page_table is None
+        and head_dim == 512
+        and head_dim_v == 512
+    ):
+        # The SM80-style SM120 forward's full-width Dv=512 PV/O path corrupts
+        # some rows. Split only V/O into two Dv=256 CuTe launches; each launch
+        # still uses the full D=512 QK score and stays below the 99 KiB SM120 cap.
+        for d_start in (0, 256):
+            d_end = d_start + 256
+            write_lse = d_start == 0 and lse is not None
+            _flash_attn_fwd(
+                q,
+                k,
+                v[..., d_start:d_end],
+                qv=None,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                min_seqlen_k=min_seqlen_k,
+                page_table=None,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                softcap=softcap,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                learnable_sink=learnable_sink,
+                tile_mn=tile_mn,
+                mma_pv_is_rs=mma_pv_is_rs,
+                intra_wg_overlap=intra_wg_overlap,
+                num_threads=num_threads,
+                num_splits=1,
+                pack_gqa=pack_gqa,
+                _arch=arch,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                block_sparse_tensors=None,
+                return_lse=write_lse,
+                out=out[..., d_start:d_end],
+                lse=lse if write_lse else None,
+                aux_tensors=aux_tensors,
+            )
+        return out, lse
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -726,6 +782,8 @@ def _flash_attn_fwd(
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
+        window_size_left_compile = Int32(0) if window_size_left is not None else None
+        window_size_right_compile = Int32(0) if window_size_right is not None else None
         (
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
@@ -953,8 +1011,8 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_compile,
+                window_size_right_compile,
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -972,8 +1030,8 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_compile,
+                window_size_right_compile,
                 learnable_sink_tensor,
             ]
             if arch // 10 in [10, 11]:
@@ -1269,8 +1327,37 @@ def _flash_attn_bwd(
     dQ_single_wg = False
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
-        m_block_size = 64
-        n_block_size = 64
+        # Backward SMEM ≈ Q + K + V + dO + fp32 accumulators; the upstream
+        # default 64x64 fits only up to D=128 on SM120. AtomLayoutMSdP * 16
+        # must divide m_block_size, and (num_warps // AtomLayoutMSdP) * 16
+        # must divide n_block_size (MMA atom is m16n8k16, 4 warps).
+        if head_dim <= 128:
+            m_block_size = 64
+            n_block_size = 64
+            AtomLayoutMSdP = 4
+            AtomLayoutNdKV = 4
+            AtomLayoutMdQ = 4
+            V_in_regs = False
+        elif head_dim <= 256:
+            # 32x32 with full SMEM: 4 * 32 * 256 * 2 = 64 KB, fits inside 99 KB.
+            m_block_size = 32
+            n_block_size = 32
+            AtomLayoutMSdP = 2
+            AtomLayoutNdKV = 2
+            AtomLayoutMdQ = 2
+            V_in_regs = False
+        else:
+            # D=512 (Gemma 4 global attention): even 32x32 with V_in_regs hits
+            # ~136 KB on SM120 once fp32 dK/dV/dQ accumulators are included.
+            # The SM80-base backward kernel just doesn't fit D=512 within the
+            # 99 KB cap; this branch is left so the kernel will compile but
+            # callers should not route D>256 backward through here yet.
+            m_block_size = 32
+            n_block_size = 32
+            AtomLayoutMSdP = 2
+            AtomLayoutNdKV = 2
+            AtomLayoutMdQ = 2
+            V_in_regs = True
         if head_dim <= 64:
             num_stages_Q = 2
             num_stages_dO = 2
@@ -1280,10 +1367,6 @@ def _flash_attn_bwd(
         SdP_swapAB = False
         dKV_swapAB = False
         dQ_swapAB = False
-        AtomLayoutMSdP = 4
-        AtomLayoutNdKV = 4
-        AtomLayoutMdQ = 4
-        V_in_regs = False
         # Match SM90 BwdConfig: dQ_single_wg is only set on the Hopper path; SM120 must set it
         # explicitly for compile_key (Dao-AILab/flash-attention#2386).
         dQ_single_wg = False
@@ -1693,6 +1776,8 @@ def _flash_attn_bwd(
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
+        window_size_left_compile = Int32(0) if window_size_left is not None else None
+        window_size_right_compile = Int32(0) if window_size_right is not None else None
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
@@ -1839,8 +1924,8 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            window_size_left,
-            window_size_right,
+            window_size_left_compile,
+            window_size_right_compile,
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
@@ -2159,8 +2244,50 @@ def flash_attn_func(
     aux_tensors: Optional[list] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
-    return_lse: bool = False,
+    return_lse: bool = True,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
 ):
+    if window_size_left is not None or window_size_right is not None:
+        assert window_size == (None, None), "pass either window_size or window_size_left/right, not both"
+        window_size = (window_size_left, window_size_right)
+    if (
+        qv is None
+        and gather_kv_indices is None
+        and learnable_sink is None
+        and softcap == 0.0
+        and num_splits == 1
+        and not deterministic
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and aux_tensors is None
+        and block_sparse_tensors is None
+        and block_sparse_tensors_bwd is None
+    ):
+        from flash_attn.cute.sm120_gemma_attention import (
+            flash_attn_sm120_gemma_func,
+            supports_dense,
+        )
+
+        if supports_dense(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+        ):
+            return flash_attn_sm120_gemma_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+            )
     return FlashAttnFunc.apply(
         q,
         k,
@@ -2212,7 +2339,9 @@ def flash_attn_varlen_func(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
-    return_lse: bool = False,
+    return_lse: bool = True,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
 ):
     """
     Explanation of some optional arguments:
@@ -2228,6 +2357,59 @@ def flash_attn_varlen_func(
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
     """
+    if window_size_left is not None or window_size_right is not None:
+        assert window_size == (None, None), "pass either window_size or window_size_left/right, not both"
+        window_size = (window_size_left, window_size_right)
+    if (
+        qv is None
+        and min_seqlen_k is None
+        and seqused_q is None
+        and seqused_k is None
+        and gather_kv_indices is None
+        and page_table is None
+        and learnable_sink is None
+        and softcap == 0.0
+        and num_splits == 1
+        and not deterministic
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and aux_tensors is None
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and max_seqlen_q is not None
+        and max_seqlen_k is not None
+    ):
+        from flash_attn.cute.sm120_gemma_attention import (
+            flash_attn_sm120_gemma_varlen_func,
+            supports_varlen,
+        )
+
+        if supports_varlen(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+        ):
+            return flash_attn_sm120_gemma_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+            )
     return FlashAttnVarlenFunc.apply(
         q,
         k,
